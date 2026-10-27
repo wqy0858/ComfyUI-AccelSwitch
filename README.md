@@ -43,10 +43,13 @@ ComfyUI 顶栏补丁，两件事：
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone <本仓库地址> ComfyUI-AccelSwitch
+git clone https://github.com/wqy0858/ComfyUI-AccelSwitch.git ComfyUI-AccelSwitch
 ```
 
-或者用 ComfyUI-Manager 的「Install via Git URL」粘贴仓库地址。
+或者：
+
+- 用 ComfyUI-Manager 的「Install via Git URL」粘贴仓库地址
+- 在 ComfyUI-Manager 的节点搜索里直接搜 **`accel`**（已上架 Comfy Registry），或命令行 `comfy node install accel-switch`
 
 **安装后浏览器要硬刷新（Ctrl+Shift+R）**，否则前端 JS 不更新。
 
