@@ -13,9 +13,14 @@
      本模块只替换自己注入的覆盖（_accel_switch_owned 标记），不碰节点设置的。
 
 选择持久化到 state.json，重启 ComfyUI 后自动恢复。
+工作流设置快照持久化到 user/AccelSwitch/snapshots.json（跟随 ComfyUI 用户目录，
+跨浏览器 / 清缓存都不丢）。
+
 API：GET  /accel_switch                  查询状态与可用后端
      POST /accel_switch {"backend": k}   切换（k=auto 恢复启动默认）
      POST /accel_switch_benchmark        跑分（可用后端耗时排序，不改当前选择）
+     GET  /accel_switch_snapshots        读取全部工作流快照
+     POST /accel_switch_snapshots {"file":..., "snapshot":...}  写入一个快照
 """
 
 import functools
@@ -228,6 +233,73 @@ def _load():
         return "auto"
 
 
+# ---------------------------------------------------------------- 工作流快照（服务端）
+
+def _snapshot_file():
+    """快照文件路径：跟随 ComfyUI 用户目录，跨浏览器 / 清缓存都不丢。"""
+    try:
+        import folder_paths
+        user_dir = folder_paths.get_user_directory()
+    except Exception:
+        user_dir = os.path.join(os.path.dirname(_DIR), "user")  # 兜底：ComfyUI/user
+    snap_dir = os.path.join(user_dir, "AccelSwitch")
+    try:
+        os.makedirs(snap_dir, exist_ok=True)
+    except Exception as e:
+        _LOG.warning("创建快照目录失败: %s", e)
+    return os.path.join(snap_dir, "snapshots.json")
+
+
+def _snapshots_load():
+    """读取全部工作流快照 -> {file: snapshot}。"""
+    with _LOCK:
+        try:
+            with open(_snapshot_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            _LOG.warning("读取快照失败: %s", e)
+            return {}
+
+
+def _snapshots_save(snapshots):
+    """把全部快照写回服务端（原子替换，防半截文件）。"""
+    path = _snapshot_file()
+    tmp = path + ".tmp"
+    with _LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshots, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except Exception as e:
+            _LOG.warning("保存快照失败: %s", e)
+            return False
+
+
+def _snapshot_put(file, snapshot):
+    """写入单个工作流的快照，返回是否成功。"""
+    if not isinstance(file, str) or not file.startswith("workflows/") or not file.endswith(".json"):
+        return False, "非法的快照文件标识"
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("nodes"), list):
+        return False, "快照格式错误（缺少 nodes）"
+    snapshots = _snapshots_load()
+    snapshot = dict(snapshot)
+    snapshot["savedAt"] = snapshot.get("savedAt") or (time.time() * 1000)
+    snapshot["file"] = file
+    # 限制体积：只保留最近 30 个工作流的快照，避免无限增长
+    snapshots[file] = snapshot
+    if len(snapshots) > 30:
+        oldest = sorted(snapshots, key=lambda k: snapshots[k].get("savedAt", 0))[:len(snapshots) - 30]
+        for k in oldest:
+            snapshots.pop(k, None)
+    if not _snapshots_save(snapshots):
+        return False, "写入快照文件失败"
+    return True, "快照已保存到服务端"
+
+
 def state_payload():
     keys = _available()
     return {
@@ -304,12 +376,23 @@ def _benchmark(params=None):
             pass
 
     results.sort(key=lambda r: r.get("ms", float("inf")))
-    return {
+    payload = {
         "ok": True,
         "params": {"warmup": warmup, "iters": iters, "tokens": tokens,
                    "heads": heads, "dim": dim},
         "results": results,
-    }, 200
+    }
+    # 写进 ComfyUI 日志：用户点跑分后在启动器/控制台就能直接看到，不必开浏览器 F12
+    ok_rows = [r for r in results if isinstance(r.get("ms"), (int, float))]
+    err_rows = [r for r in results if r.get("error")]
+    if ok_rows:
+        ranking = " | ".join("%s %.3fms" % (r["label"], r["ms"]) for r in ok_rows)
+        _LOG.info("[后端跑分] 毫秒/次（越小越快）: %s", ranking)
+    else:
+        _LOG.warning("[后端跑分] 没有可用的加速后端完成测试")
+    for r in err_rows:
+        _LOG.info("[后端跑分] %s 不可用: %s", r["label"], r["error"])
+    return payload, 200
 
 
 # ---------------------------------------------------------------- HTTP 接口
@@ -354,6 +437,21 @@ def _register_routes():
             data = {}
         payload, status = _benchmark(data)
         return web.json_response(payload, status=status)
+
+    @routes.get("/accel_switch_snapshots")
+    async def get_snapshots(request):
+        return web.json_response({"ok": True, "snapshots": _snapshots_load()})
+
+    @routes.post("/accel_switch_snapshots")
+    async def put_snapshot(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        ok, msg = _snapshot_put(data.get("file"), data.get("snapshot"))
+        if not ok:
+            return web.json_response({"ok": False, "error": msg}, status=400)
+        return web.json_response({"ok": True, "message": msg})
 
     routes._accel_switch_registered = True
 

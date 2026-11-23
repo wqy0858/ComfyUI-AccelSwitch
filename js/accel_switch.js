@@ -1,47 +1,50 @@
 /**
- * ComfyUI-AccelSwitch — 顶栏一键切换全局注意力加速后端 + 顶栏缩放
+ * ComfyUI-AccelSwitch — 顶栏一键切换全局注意力加速后端 + 顶栏缩放 + 工作流设置快照
  *
  * 位置：顶部命令栏（与“管理器 / 翻译开关”同一行），优先贴在运行按钮组左侧。
  * 形态：与“运行 ▾”同款 SplitButton——点主体循环切换，点箭头弹出完整列表。
- *       主体为纯图标（闪电），当前后端名在悬停提示里；下拉列表可选完整后端。
- * 顶栏缩放：下拉菜单里有 100%~60% 五档，对整个顶栏整列（命令栏卡片 + 队列/
- *       任务浮层）做 CSS zoom 等比缩小，选择记 localStorage，刷新不丢。
- * 快照：保存工作流时记录后端/缩放/节点参数；打开工作流自动套用保存时的后端/缩放；
- *       下拉菜单「↺」一键恢复节点参数；Ctrl+Alt+A 切换、Ctrl+Alt+R 恢复。
- * 数据：GET/POST ./accel_switch（见 custom_nodes/ComfyUI-AccelSwitch/__init__.py）。
+ * 顶栏缩放：下拉菜单 100%~60% 五档，对整个顶栏整列做 CSS zoom，记 localStorage。
+ * 快照：保存工作流时记录 [后端 + 缩放 + 所有节点参数(含图像)] 到**服务端**
+ *       user/AccelSwitch/snapshots.json；跨浏览器 / 清缓存不丢。
+ *       打开工作流自动套用保存时的后端/缩放；菜单「↺」一键恢复全部节点参数。
+ *       Ctrl+Alt+A 切换后端，Ctrl+Alt+R 恢复快照。
+ * 跑分：合成注意力负载测各可用后端，结果同时写入 ComfyUI 日志 + 界面弹窗。
+ * 数据接口见 custom_nodes/ComfyUI-AccelSwitch/__init__.py。
  */
 
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const API = "./accel_switch";
+const SNAP_API = "./accel_switch_snapshots";
 const LOG_TAG = "[AccelSwitch]";
 const log = (...a) => console.log(LOG_TAG, ...a);
 const warn = (...a) => console.warn(LOG_TAG, ...a);
 
 /** @type {{current:string, available:Object, all:Object}} */
 let state = { current: "auto", available: {}, all: {} };
-let split = null;          // 当前 ComfySplitButton 实例
-let primaryBtn = null;     // 主体按钮（图标 + 当前后端简称）
-let badgeText = "";        // 主体按钮的常态文字（闪烁提示结束后恢复）
-let inserted = false;      // 是否已插入命令栏
+let split = null;
+let primaryBtn = null;
+let badgeText = "";
+let inserted = false;
 let watchdog = null;
-let lastSnapshot = null;   // 最近一次保存的快照
-let snapshots = {};        // file -> 快照（支持打开工作流自动套用）
-let fetchHooked = false;   // api.fetchApi 是否已挂钩
+let lastSnapshot = null;   // 最近一次保存的快照（与服务端同步）
+let snapshots = {};        // file -> 快照
+let fetchHooked = false;
+let snapshotsLoaded = false;
 
 // ---------------------------------------------------------------- 顶栏缩放
 
 const ZOOM_KEY = "Comfy.AccelSwitch.TopbarZoom";
 const ZOOM_LEVELS = [1, 0.9, 0.8, 0.7, 0.6];
-let zoomValue = 0.8;       // 默认紧凑（用户反馈顶栏占地方）
+let zoomValue = 0.8;
 
 function loadZoom() {
   try {
     const v = parseFloat(localStorage.getItem(ZOOM_KEY));
     if (ZOOM_LEVELS.includes(v)) zoomValue = v;
   } catch {
-    /* localStorage 不可用时保持默认 */
+    /* localStorage 不可用保持默认 */
   }
 }
 
@@ -53,11 +56,6 @@ function saveZoom() {
   }
 }
 
-/**
- * 顶栏"右列"：包含命令栏卡片（top-menu-actionbars）与队列/任务浮层的整列。
- * 它是内容宽度（非拉伸），zoom 它不会在全宽顶栏上留下右侧空缺；
- * 面包屑列在左侧不受影响（主画布下为空）。
- */
 function zoomRoot() {
   const ab = document.querySelector('[data-testid="top-menu-actionbars"]');
   if (!ab) return null;
@@ -111,12 +109,42 @@ async function apiBenchmark() {
   return j;
 }
 
+async function apiGetSnapshots() {
+  const r = await fetch(SNAP_API, { method: "GET" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  return j.snapshots || {};
+}
+
+async function apiPutSnapshot(file, snapshot) {
+  const r = await fetch(SNAP_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file, snapshot }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+
 // ---------------------------------------------------------------- 工作流设置快照
 
 const SNAP_KEY = "Comfy.AccelSwitch.LastWorkflowSnapshot";
 const SNAP_MAP_KEY = "Comfy.AccelSwitch.WorkflowSnapshots";
 
-function loadSnapshot() {
+function cacheSnapshotLocal(snap) {
+  lastSnapshot = snap;
+  snapshots[snap.file] = snap;
+  try {
+    localStorage.setItem(SNAP_KEY, JSON.stringify(snap));
+    localStorage.setItem(SNAP_MAP_KEY, JSON.stringify(snapshots));
+  } catch (e) {
+    warn("本地缓存快照失败（不影响服务端存储）:", e.message || e);
+  }
+}
+
+/** 从 localStorage 读缓存（服务端不可用时的兜底 + 迁移 v1.1.0 单快照）。 */
+function loadSnapshotCache() {
   try {
     snapshots = JSON.parse(localStorage.getItem(SNAP_MAP_KEY) || "{}") || {};
   } catch {
@@ -127,7 +155,6 @@ function loadSnapshot() {
   } catch {
     lastSnapshot = null;
   }
-  // 迁移 v1.1.0 的单快照格式
   if (lastSnapshot?.file && !snapshots[lastSnapshot.file]) {
     snapshots[lastSnapshot.file] = lastSnapshot;
     try {
@@ -138,14 +165,25 @@ function loadSnapshot() {
   }
 }
 
-function storeSnapshot(snap) {
-  lastSnapshot = snap;
-  snapshots[snap.file] = snap;
+/** 从服务端加载快照（权威来源，跨浏览器共享）。 */
+async function loadSnapshotsFromServer() {
   try {
-    localStorage.setItem(SNAP_KEY, JSON.stringify(snap));
-    localStorage.setItem(SNAP_MAP_KEY, JSON.stringify(snapshots));
+    const fromServer = await apiGetSnapshots();
+    snapshots = fromServer;
+    // 最近保存的那个作为 lastSnapshot：服务端快照里 savedAt 最大的
+    const files = Object.keys(snapshots);
+    if (files.length) {
+      lastSnapshot = files
+        .map((f) => snapshots[f])
+        .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))[0];
+    }
+    snapshotsLoaded = true;
+    log("已从服务端加载工作流快照:", files.length, "个");
+    return true;
   } catch (e) {
-    warn("保存设置快照失败（localStorage）:", e.message || e);
+    warn("从服务端加载快照失败，回退本地缓存:", e.message || e);
+    snapshotsLoaded = false;
+    return false;
   }
 }
 
@@ -153,15 +191,35 @@ function clone(v) {
   return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
 }
 
-/** 工作流保存到 userdata 的那一刻，记录后端 / 缩放 / 所有节点参数。 */
-function captureSnapshot(file, workflow) {
-  const nodes = (workflow?.nodes || []).map((n) => ({
+/** 取当前画布所有节点的序列化数据（含图像 widget 的真实值）。 */
+function graphNodesSerialized() {
+  try {
+    const g = app.graph;
+    if (!g) return [];
+    if (typeof g.serialize === "function") {
+      return g.serialize().nodes || [];
+    }
+    if (Array.isArray(g.nodes)) {
+      return g.nodes.map((n) => (typeof n.serialize === "function" ? n.serialize() : n));
+    }
+  } catch (e) {
+    warn("读取画布节点失败:", e.message || e);
+  }
+  return [];
+}
+
+/** 保存工作流那一刻，抓后端 / 缩放 / 所有节点参数，写服务端 + 本地缓存。 */
+function captureSnapshot(file) {
+  const raw = graphNodesSerialized();
+  const nodes = raw.map((n) => ({
     id: n.id,
     type: n.type,
     title: n.title ?? null,
     mode: n.mode ?? 0,
     widgets_values: clone(n.widgets_values) ?? null,
+    widgets_values_named: clone(n.widgets_values_named) ?? null,
     flags: clone(n.flags) ?? null,
+    properties: clone(n.properties) ?? null,
   }));
   const snap = {
     file,
@@ -170,44 +228,50 @@ function captureSnapshot(file, workflow) {
     zoom: zoomValue,
     nodes,
   };
-  storeSnapshot(snap);
+  cacheSnapshotLocal(snap);
+  // 服务端持久化（跨浏览器 / 清缓存不丢）
+  apiPutSnapshot(file, snap)
+    .then(() => log("快照已写入服务端:", file, "| 节点:", nodes.length))
+    .catch((e) => warn("快照写入服务端失败（仅存本地）:", e.message || e));
   log("已记录工作流保存时的设置:", file,
       "| 后端:", state.current,
       "| 缩放:", Math.round(zoomValue * 100) + "%",
       "| 节点:", nodes.length);
 }
 
+/** 从 body 里尽力解析出文件标识（新版 storeUserData 的 body 可能含 full_info 等）。 */
+function parseWorkflowFile(routeStr) {
+  try {
+    const clean = String(routeStr || "").split("?")[0];
+    if (!clean.startsWith("/userdata/")) return null;
+    const file = decodeURIComponent(clean.slice("/userdata/".length));
+    if (!file.startsWith("workflows/") || !file.endsWith(".json") || file.endsWith(".index.json")) {
+      return null;
+    }
+    return file;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 拦截 api.fetchApi：
- *  - POST /userdata/workflows/xxx.json 成功 → 抓快照（后端/缩放/节点参数）
- *  - GET  /userdata/workflows/xxx.json 成功 → 自动套用该工作流保存时的后端/缩放
- * 这样不依赖前端 Pinia 内部 API，ComfyUI 前端升级也不容易失效。
+ *  - POST /userdata/workflows/xxx.json 成功 → 抓快照
+ *  - GET  同上成功 → 自动套用保存时的后端/缩放
+ * 新版前端 1.59 保存走 api.storeUserData -> api.fetchApi，钩子仍然生效。
  */
 function hookWorkflowSave() {
   if (fetchHooked || !api || typeof api.fetchApi !== "function") return;
   const original = api.fetchApi.bind(api);
   api.fetchApi = async function (route, init) {
     const method = ((init?.method) || "GET").toUpperCase();
+    const file = parseWorkflowFile(route);
     const response = await original(route, init);
     try {
-      const url = String(route || "");
-      if (!url.startsWith("/userdata/") || !response || response.ok === false) {
-        return response;
-      }
-      const clean = url.split("?")[0];
-      const file = decodeURIComponent(clean.slice("/userdata/".length));
-      if (!file.startsWith("workflows/") || !file.endsWith(".json") || file.endsWith(".index.json")) {
-        return response;
-      }
-
+      if (!file || !response || response.ok === false) return response;
       if (method === "POST") {
-        let workflow = null;
-        try {
-          workflow = JSON.parse(init.body);
-        } catch {
-          /* body 不是 JSON 就跳过节点参数 */
-        }
-        if (workflow && Array.isArray(workflow.nodes)) captureSnapshot(file, workflow);
+        // 直接读画布当前状态，比解析 body 更可靠（body 格式随前端版本变化）
+        captureSnapshot(file);
       } else if (method === "GET") {
         const snap = snapshots[file];
         if (snap) {
@@ -224,7 +288,8 @@ function hookWorkflowSave() {
 }
 
 /**
- * 套用快照里的插件设置；withNodes=true 时连节点参数一起还原。
+ * 套用快照设置。withNodes=true 时用 LiteGraph 官方 node.configure() 恢复
+ * 全部节点参数（含图像 widget），绕过手写 widget.value 在新版前端失效的问题。
  * 打开工作流时只套后端/缩放（节点参数本来就来自工作流文件本身）。
  */
 async function applySnapshotSettings(snap, withNodes = true) {
@@ -236,28 +301,30 @@ async function applySnapshotSettings(snap, withNodes = true) {
       for (const item of snap.nodes || []) {
         const node = graph?.getNodeById?.(item.id);
         if (!node) continue;
-        if (Array.isArray(item.widgets_values)) {
-          const values = clone(item.widgets_values);
-          node.widgets_values = values;
-          (node.widgets || []).forEach((widget, i) => {
-            if (i >= values.length) return;
-            try {
-              widget.value = values[i];
-            } catch {
-              /* 某些自定义 widget 不接受直接赋值，widgets_values 仍已写入 */
-            }
-          });
-        }
-        if (item.mode !== undefined && item.mode !== null) node.mode = item.mode;
-        if (item.title !== undefined && item.title !== null) node.title = item.title;
-        if (item.flags) {
-          try {
-            node.flags = clone(item.flags);
-          } catch {
-            /* 忽略 */
+        try {
+          // 用节点自身的序列化作为基底，保证 inputs/outputs/连线信息完整，
+          // configure 只覆盖参数字段，不会拆掉现有连线。
+          const base = (typeof node.serialize === "function") ? node.serialize() : {};
+          const info = {
+            ...base,
+            id: item.id,
+            widgets_values: clone(item.widgets_values) ?? base.widgets_values,
+            mode: item.mode ?? base.mode ?? 0,
+            title: item.title ?? base.title,
+            flags: clone(item.flags) ?? base.flags,
+            properties: clone(item.properties) ?? base.properties,
+          };
+          if (item.widgets_values_named) info.widgets_values_named = clone(item.widgets_values_named);
+          if (typeof node.configure === "function") {
+            node.configure(info);
+          } else {
+            // 极老前端兜底
+            node.widgets_values = clone(item.widgets_values);
           }
+          matched++;
+        } catch (e) {
+          warn("恢复节点 #" + item.id + " 失败:", e.message || e);
         }
-        matched++;
       }
       graph?.setDirtyCanvas?.(true, true);
     } catch (e) {
@@ -279,8 +346,16 @@ async function applySnapshotSettings(snap, withNodes = true) {
   return matched;
 }
 
-/** 一键恢复：后端 + 顶栏缩放 + 每个节点的参数（widget 值 / 旁通状态 / 标题）。 */
+/** 一键恢复：后端 + 顶栏缩放 + 所有节点参数（含图像）。 */
 async function restoreSnapshot() {
+  // 优先服务端最新快照
+  if (snapshotsLoaded) {
+    try {
+      await loadSnapshotsFromServer();
+    } catch {
+      /* 用现有缓存 */
+    }
+  }
   const snap = lastSnapshot;
   if (!snap) {
     warn("还没有快照：请先保存一次工作流");
@@ -290,23 +365,78 @@ async function restoreSnapshot() {
   const matched = await applySnapshotSettings(snap, true);
   flashNotice("✓ 已恢复", true);
   log("恢复完成:", snap.file, "| 匹配节点:", matched);
+  showResultPanel("设置已恢复", [
+    "工作流: " + snap.file,
+    "恢复节点: " + matched + " 个（含图像等参数）",
+    "后端: " + (state.available[snap.backend]?.label || snap.backend || "-"),
+    "保存时间: " + (snap.savedAt ? new Date(snap.savedAt).toLocaleString() : "-"),
+  ], true);
 }
 
-/** 跑分：只测注册表里的可用后端，不改当前选择；结果显示在 Console。 */
+// ---------------------------------------------------------------- 可见结果面板
+
+let resultPanel = null;
+let resultTimer = null;
+function showResultPanel(title, lines, ok = true) {
+  try {
+    if (resultPanel) resultPanel.remove();
+    if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
+    const el = document.createElement("div");
+    el.id = "accel-switch-result";
+    Object.assign(el.style, {
+      position: "fixed", right: "18px", bottom: "18px", zIndex: "99999",
+      maxWidth: "440px", minWidth: "300px", padding: "14px 16px",
+      background: "var(--color-background-primary, #1e1e1e)",
+      color: "var(--color-text-primary, #ddd)",
+      border: "1px solid " + (ok ? "#1D9E75" : "#E24B4A"),
+      borderRadius: "10px", font: "13px/1.6 var(--font-sans, sans-serif)",
+      boxShadow: "0 6px 24px rgba(0,0,0,.3)",
+    });
+    const h = document.createElement("div");
+    h.textContent = title;
+    Object.assign(h.style, { fontWeight: "600", marginBottom: "8px", fontSize: "14px" });
+    el.appendChild(h);
+    for (const line of lines) {
+      const p = document.createElement("div");
+      p.textContent = line;
+      p.style.whiteSpace = "pre-wrap";
+      el.appendChild(p);
+    }
+    const close = document.createElement("div");
+    close.textContent = "点击关闭";
+    Object.assign(close.style, { marginTop: "10px", opacity: ".6", cursor: "pointer", fontSize: "12px" });
+    close.onclick = () => el.remove();
+    el.appendChild(close);
+    (document.body || document.documentElement).appendChild(el);
+    resultPanel = el;
+    resultTimer = setTimeout(() => { if (el.parentNode) el.remove(); resultPanel = null; }, 12000);
+  } catch (e) {
+    warn("显示结果面板失败:", e.message || e);
+  }
+}
+
+/** 跑分：后端写日志 + 前端弹面板，点一下就能看到，不用开 F12。 */
 async function runBenchmark() {
   flashNotice("测速中…", true);
   try {
     const j = await apiBenchmark();
     const rows = j.results || [];
-    const ranked = rows.filter((r) => typeof r.ms === "number")
-      .map((r) => `${r.label} ${r.ms}ms`).join(" > ");
+    const okRows = rows.filter((r) => typeof r.ms === "number");
+    const errRows = rows.filter((r) => r.error);
+    const lines = okRows.length
+      ? okRows.map((r, i) => (i + 1) + ". " + r.label + "  " + r.ms + " ms")
+      : ["没有可用的后端完成测试"];
+    for (const r of errRows) lines.push("✗ " + r.label + ": " + r.error);
+    lines.push("参数: " + JSON.stringify(j.params || {}));
+    lines.push("完整结果已写入 ComfyUI 日志（搜索「后端跑分」）");
     console.table(rows);
-    log("后端跑分完成（毫秒/次，越小越快）:", ranked || "无可用结果",
-        "| 参数:", j.params);
+    log("后端跑分完成:", lines.join(" | "));
     flashNotice("✓ 跑分完成", true);
+    showResultPanel("后端跑分（毫秒/次，越小越快）", lines, okRows.length > 0);
   } catch (e) {
     warn("跑分失败:", e.message || e);
     flashError();
+    showResultPanel("跑分失败", [e.message || String(e)], false);
   }
 }
 
@@ -318,7 +448,6 @@ async function getComponents() {
     const { ComfySplitButton } = window.comfyAPI.splitButton;
     return { ComfyButton, ComfySplitButton };
   }
-  // 兜底：旧版 shim（会打一条 deprecation 警告，功能正常）
   const [b, s] = await Promise.all([
     import("../../../scripts/ui/components/button.js"),
     import("../../../scripts/ui/components/splitButton.js"),
@@ -371,7 +500,6 @@ async function render() {
   const cur = state.current;
   const curLabel = state.available[cur]?.label || state.all?.[cur]?.label || cur;
   const curShort = state.available[cur]?.short || state.all?.[cur]?.short || cur;
-  // 主体：闪电图标 + 当前后端简称（常驻徽章）；错误提示结束会恢复徽章文字
   badgeText = curShort;
   primaryBtn = new ComfyButton({
     icon: "bolt",
@@ -388,32 +516,27 @@ async function render() {
     const available = b.available !== false;
     return new ComfyButton({
       content: (active ? "✓  " : "    ") + b.label,
-      tooltip: available
-        ? (b.desc || "")
+      tooltip: available ? (b.desc || "")
         : `${b.desc || b.label}：当前不可用（未安装或硬件不支持）`,
-      classList: "accel-switch-item"
-        + (active ? " accel-switch-active" : "")
+      classList: "accel-switch-item" + (active ? " accel-switch-active" : "")
         + (available ? "" : " accel-switch-unavailable"),
       action: () => available ? choose(key) : flashNotice("当前不可用", false),
     }).element;
   });
-  // 后端跑分（合成负载，不改当前选择）
   items.push(new ComfyButton({
     content: "     ⚡ 后端跑分",
-    tooltip: "用固定合成注意力负载测试各可用后端，结果输出到浏览器控制台",
+    tooltip: "合成注意力负载测各后端，结果弹窗显示并写入 ComfyUI 日志；不改当前选择",
     classList: "accel-switch-item accel-switch-bench-item",
     action: () => runBenchmark(),
   }).element);
-  // 一键恢复上次保存工作流时的设置（后端 + 缩放 + 节点参数）
   items.push(new ComfyButton({
     content: (lastSnapshot ? "↺  " : "    ") + "恢复上次保存的设置",
     tooltip: lastSnapshot
-      ? `恢复 ${lastSnapshot.file} 保存时的加速后端 / 顶栏缩放 / ${lastSnapshot.nodes.length} 个节点参数`
+      ? `恢复 ${lastSnapshot.file} 保存时的后端 / 缩放 / ${lastSnapshot.nodes?.length || 0} 个节点参数（含图像）`
       : "尚无快照：请先保存一次工作流",
     classList: "accel-switch-item accel-switch-restore-item" + (lastSnapshot ? " accel-switch-active" : ""),
     action: () => restoreSnapshot(),
   }).element);
-  // 分隔线 + 顶栏缩放档位
   const sep = document.createElement("div");
   sep.className = "accel-switch-sep";
   items.push(sep);
@@ -421,8 +544,7 @@ async function render() {
     const active = z === zoomValue;
     items.push(new ComfyButton({
       content: (active ? "✓  " : "    ") + `顶栏缩放 ${Math.round(z * 100)}%`,
-      tooltip: z === 1
-        ? "恢复顶栏原始大小"
+      tooltip: z === 1 ? "恢复顶栏原始大小"
         : `整个顶栏缩小到 ${Math.round(z * 100)}%（含队列/任务浮层）`,
       classList: "accel-switch-item accel-switch-zoom-item",
       action: () => setZoom(z),
@@ -452,10 +574,6 @@ function isVisibleEl(el) {
 
 function insert() {
   if (!split) return false;
-  // 1) 新版 Vue 命令栏（0.4x 起 .comfy-menu/menuContainer 被 display:none）：
-  //    插到 settingsGroup 之前——ComfyUI-Manager 与中文翻译扩展同款策略。
-  //    注意用元素自身的 before()：插入时该元素可能尚未挂到可见 DOM，
-  //    Vue watchEffect 稍后会随父容器整体进入命令栏（翻译扩展实测路径）。
   const sg = app.menu?.settingsGroup?.element;
   if (sg && typeof sg.before === "function") {
     sg.before(split.element);
@@ -464,7 +582,6 @@ function insert() {
       return true;
     }
   }
-  // 2) 旧版前端：仅当 .comfy-menu 与 menuContainer 均可见时才用
   const host = app.ui?.menuContainer || document.querySelector(".comfy-menu");
   const comfyMenu = document.querySelector(".comfy-menu");
   if (host && isVisibleEl(comfyMenu) && isVisibleEl(host)) {
@@ -477,7 +594,6 @@ function insert() {
     inserted = true;
     return true;
   }
-  // 3) 兜底：workflow 标签栏
   const topRight = document.querySelector(".workflow-tabs-container .ml-auto");
   if (topRight) {
     topRight.prepend(split.element);
@@ -496,16 +612,13 @@ function insert() {
 function startWatchdog() {
   if (watchdog) clearInterval(watchdog);
   watchdog = setInterval(() => {
-    // 顶栏缩放：Vue 重渲染可能重建右列 → 补挂 zoom
     const zr = zoomRoot();
     if (zr && zr.style.zoom !== String(zoomValue)) applyZoom();
     if (!split) return;
     if (!split.element.isConnected) {
-      // 顶栏被 Vue 重渲染冲掉 → 重新插入
       insert();
       return;
     }
-    // 若本按钮排在运行按钮组之后（渲染顺序晚于它）→ 尝试搬到其左侧
     const runBtn = document.querySelector(".comfyui-split-button");
     if (runBtn && runBtn !== split.element
         && split.element.parentElement === runBtn.parentElement
@@ -526,17 +639,11 @@ function injectStyles() {
   const st = document.createElement("style");
   st.id = STYLE_ID;
   st.textContent = [
-    // 纯图标主体：左右补点 padding，看起来和旁边的图标按钮一致
     "#accel-switch-split .comfyui-split-primary .comfyui-button{padding-left:10px;padding-right:10px}",
-    // 下拉里的分组分隔线
     ".accel-switch-sep{height:1px;margin:4px 6px;background:currentColor;opacity:.25;flex:none}",
-    // 缩放档位字号略小，跟后端项区分
     ".accel-switch-zoom-item{font-size:.92em}",
-    // 恢复项稍作强调，和后端列表区分
     ".accel-switch-restore-item{font-weight:600}",
-    // 当前机器未装/不支持的后端：保留在列表里但灰显
     ".accel-switch-unavailable{opacity:.4;cursor:not-allowed}",
-    // 跑分项与恢复项同属「工具区」
     ".accel-switch-bench-item{font-weight:600}",
   ].join("\n");
   (document.head || document.documentElement).appendChild(st);
@@ -569,11 +676,12 @@ app.registerExtension({
 
   async setup() {
     loadZoom();
-    loadSnapshot();
+    loadSnapshotCache();
     hookWorkflowSave();
     setupHotkeys();
     injectStyles();
-    // 顶栏锚点可能尚未就绪：轮询等待（最多 ~30s）
+    // 服务端快照为权威来源，异步拉；拉到后重绘菜单（让「↺」项显示）
+    loadSnapshotsFromServer().then(() => render()).catch(() => {});
     let tries = 0;
     while (tries++ < 60) {
       try {
@@ -596,6 +704,7 @@ app.registerExtension({
     applyZoom();
     startWatchdog();
     log("顶栏按钮已就绪 | 当前:", state.current, "| 可用:", keys().join(", "),
-        "| 顶栏缩放:", Math.round(zoomValue * 100) + "%");
+        "| 顶栏缩放:", Math.round(zoomValue * 100) + "%",
+        "| 服务端快照:", snapshotsLoaded ? "已加载" : "本地缓存");
   },
 });

@@ -42,26 +42,27 @@ ComfyUI 顶栏补丁，四件事：
 
 ## 功能三：保存时快照 / 一键恢复
 
-每次你点 ComfyUI 的「保存工作流」，本插件会把那一刻的设置存一份快照（存在浏览器 localStorage，刷新 / 重启不丢）：
+每次你点 ComfyUI 的「保存工作流」，本插件会把那一刻的设置存一份快照到**服务端** `user/AccelSwitch/snapshots.json`（跟随 ComfyUI 用户目录，**换浏览器 / 清缓存都不丢**；浏览器 localStorage 只作兜底缓存）：
 
 - **加速后端**：当时顶栏选的是哪个后端
 - **顶栏缩放**：当时的缩放档位
-- **所有节点参数**：每个节点的 widget 值、旁通状态（mode）、标题
+- **所有节点参数**：每个节点的 widget 值（**含图像节点选的图**）、旁通状态（mode）、标题
 
 下拉菜单里的 **「↺ 恢复上次保存的设置」** 一键把这三样一起还原到当前工作流：
 
-- 节点按 ID 匹配，只覆盖当前图里还存在的节点，不会新建 / 删除节点或连线
+- 节点按 ID 匹配，用 LiteGraph 官方 `node.configure()` 恢复参数（图像节点的图像能正确还原），只覆盖当前图里还存在的节点，**不会新建 / 删除节点或连线**
 - 后端恢复走原有的切换接口（不可用时会提示并保持当前后端）
 - 快照按工作流文件路径分别保存，菜单悬停提示里能看到是哪个文件、多少个节点
 - **打开工作流时自动套用**该文件保存时的「后端 + 缩放」（节点参数仍来自工作流文件本身，不会被快照覆盖）
+- 恢复完成会弹出可见的确认面板；`Ctrl+Alt+R` 快捷键同样能恢复
 
-> 这个功能是「设置快照」，不是工作流版本管理；节点丢失 / 连线变化请仍以 ComfyUI 自己的工作流文件为准。快照存在浏览器 localStorage，换浏览器或清缓存会丢。
+> 这个功能是「设置快照」，不是工作流版本管理；节点增删 / 连线变化请仍以 ComfyUI 自己的工作流文件为准——快照只负责把还存在的节点参数拧回保存时的值。快照服务端最多保留最近 30 个工作流。
 
 ## 功能四：后端跑分
 
 下拉菜单里的 **「⚡ 后端跑分」** 会对当前可用的后端逐个跑同一份合成注意力负载（默认 2 次预热 + 5 次计时，256 token / 8 头 / 64 维 fp16），然后：
 
-- 按耗时从快到慢排序，**结果输出到浏览器 Console**（`console.table`），同时打印一行 `A > B > C`
+- 按耗时从快到慢排序，**同时写到两个地方**：① 屏幕右下角弹出可见结果面板（点一下就能看到，不用开 F12）；② ComfyUI 服务端日志，搜索 **`后端跑分`** 即可（`user/comfyui.log` / 启动器控制台）
 - 只直接调用注册表里的注意力函数，**不修改当前后端、不碰已加载模型**，跑完自动清缓存
 - 需要 CUDA；不可用的后端会单独标 error，不影响其他项
 - 请求体可覆盖参数：`{"warmup":2,"iters":5,"tokens":256,"heads":8,"dim":64}`
@@ -85,9 +86,11 @@ git clone https://github.com/wqy0858/ComfyUI-AccelSwitch.git ComfyUI-AccelSwitch
 ## HTTP API
 
 ```text
-GET  /accel_switch                     → {"current": "...", "available": {...}, "all": {...含 available 标记}, "startup_default": "..."}
+GET  /accel_switch                      → {"current": "...", "available": {...}, "all": {...含 available 标记}, "startup_default": "..."}
 POST /accel_switch  {"backend": "sage"} → 切换并返回新状态（auto = 恢复启动默认）
-POST /accel_switch_benchmark  {}        → {"ok": true, "params": {...}, "results": [{"label": "...", "ms": 0.123}, ...]}
+POST /accel_switch_benchmark  {}         → {"ok": true, "params": {...}, "results": [{"label": "...", "ms": 0.123}, ...]}
+GET  /accel_switch_snapshots            → {"ok": true, "snapshots": {"workflows/xx.json": {...}, ...}}
+POST /accel_switch_snapshots  {"file": "workflows/xx.json", "snapshot": {...}} → 写入快照（最多保留 30 个）
 ```
 
 ## 已知边界
@@ -98,7 +101,7 @@ POST /accel_switch_benchmark  {}        → {"ok": true, "params": {...}, "resul
 
 ## 兼容性
 
-- 开发验证环境：ComfyUI 0.43 + 前端 1.57.4（按钮与缩放按新版前端设计）
+- 开发验证环境：ComfyUI 0.43 + 前端 1.59.11（按钮、快照钩子与缩放按新版前端设计并实测）
 - 老版本前端：切换按钮仍尝试挂载（有兜底路径），顶栏缩放不生效
 - 接口对不上时安静降级（打警告行），不会导致 ComfyUI 启动失败
 

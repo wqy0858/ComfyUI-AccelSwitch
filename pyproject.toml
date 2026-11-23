@@ -1,7 +1,7 @@
 [project]
 name = "accel-switch"
-version = "1.2.0"
-description = "ComfyUI 顶栏加速切换 + 缩放 + 工作流设置快照/自动套用/一键恢复 + 后端跑分（纯补丁，无节点）| Switch attention backend, zoom, restore saved settings and benchmark backends"
+version = "1.3.0"
+description = "ComfyUI 顶栏加速切换 + 缩放 + 服务端工作流设置快照/一键恢复(含图像) + 后端跑分(日志+面板)（纯补丁，无节点）| Switch attention backend, zoom, restore saved settings (including images) with server-side snapshots, and benchmark backends"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 classifiers = [
