@@ -21,6 +21,8 @@ API：GET  /accel_switch                  查询状态与可用后端
      POST /accel_switch_benchmark        跑分（可用后端耗时排序，不改当前选择）
      GET  /accel_switch_snapshots        读取全部工作流快照
      POST /accel_switch_snapshots {"file":..., "snapshot":...}  写入一个快照
+     GET  /accel_switch_presets?workflow=...  读取该工作流的参数模板
+     POST /accel_switch_presets {"workflow":..., "action":"save"|"delete", "name":..., "preset":...}
 """
 
 import functools
@@ -300,6 +302,148 @@ def _snapshot_put(file, snapshot):
     return True, "快照已保存到服务端"
 
 
+# ---------------------------------------------------------------- 常用参数模板（服务端）
+
+def _preset_file():
+    """模板文件路径：与快照同目录，跨浏览器 / 清缓存都不丢。"""
+    try:
+        import folder_paths
+        user_dir = folder_paths.get_user_directory()
+    except Exception:
+        user_dir = os.path.join(os.path.dirname(_DIR), "user")
+    preset_dir = os.path.join(user_dir, "AccelSwitch")
+    try:
+        os.makedirs(preset_dir, exist_ok=True)
+    except Exception as e:
+        _LOG.warning("创建模板目录失败: %s", e)
+    return os.path.join(preset_dir, "presets.json")
+
+
+def _presets_load_all():
+    """读取 -> {workflowKey: {模板名: 模板}}。
+
+    模板按工作流隔离。旧版（未按工作流区分）的数据归档到 __legacy__，
+    不在任何工作流里显示，避免张冠李戴。
+    """
+    with _LOCK:
+        try:
+            with open(_preset_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            _LOG.warning("读取参数模板失败: %s", e)
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("__v") == 2 and isinstance(data.get("workflows"), dict):
+        return {k: v for k, v in data["workflows"].items() if isinstance(v, dict)}
+    legacy = {k: v for k, v in data.items()
+              if isinstance(v, dict) and isinstance(v.get("values"), list)}
+    return {"__legacy__": legacy} if legacy else {}
+
+
+def _presets_save_all(by_workflow):
+    path = _preset_file()
+    tmp = path + ".tmp"
+    with _LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"__v": 2, "workflows": by_workflow}, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except Exception as e:
+            _LOG.warning("保存参数模板失败: %s", e)
+            return False
+
+
+def _valid_workflow_key(key):
+    return isinstance(key, str) and 0 < len(key) <= 300 and "\x00" not in key
+
+
+def _valid_preset_name(name):
+    if not isinstance(name, str):
+        return False
+    name = name.strip()
+    return bool(name) and len(name) <= 40 and not any(
+        c in name for c in ("/", "\\", "..", "\x00")
+    )
+
+
+def _presets_for(workflow):
+    """某个工作流的模板（不含 __legacy__）。"""
+    if not _valid_workflow_key(workflow):
+        return {}
+    return _presets_load_all().get(workflow, {})
+
+
+def _preset_put(workflow, name, preset):
+    if not _valid_workflow_key(workflow):
+        return False, "工作流标识非法"
+    if not _valid_preset_name(name):
+        return False, "模板名非法（1~40 字符，不能含路径分隔符）"
+    if not isinstance(preset, dict) or not isinstance(preset.get("values"), list):
+        return False, "模板格式错误（缺少 values）"
+    name = name.strip()
+    by_workflow = _presets_load_all()
+    bucket = by_workflow.setdefault(workflow, {})
+    p = dict(preset)
+    p["savedAt"] = p.get("savedAt") or (time.time() * 1000)
+    p["name"] = name
+    bucket[name] = p
+    # 每个工作流最多 20 个，按保存时间淘汰最旧的
+    if len(bucket) > 20:
+        oldest = sorted(bucket, key=lambda k: bucket[k].get("savedAt", 0))[:len(bucket) - 20]
+        for k in oldest:
+            bucket.pop(k, None)
+    if not _presets_save_all(by_workflow):
+        return False, "写入模板文件失败"
+    _LOG.info("已保存参数模板: [%s] %s（%d 项参数，%d 个旁通/忽略节点）",
+              workflow, name, len(p.get("values") or []),
+              len([m for m in (p.get("modes") or []) if isinstance(m, dict) and m.get("mode")]))
+    return True, "模板已保存到服务端"
+
+
+def _preset_move(src, dst):
+    """工作流另存为 / 改名时，把模板归属一起搬到新路径，避免"模板突然消失"。"""
+    if not _valid_workflow_key(src) or not _valid_workflow_key(dst):
+        return False, "工作流标识非法"
+    if src == dst:
+        return True, "无需迁移"
+    by_workflow = _presets_load_all()
+    bucket = by_workflow.pop(src, None)
+    if not bucket:
+        return True, "无模板需迁移"
+    merged = by_workflow.get(dst) or {}
+    merged.update(bucket)
+    by_workflow[dst] = merged
+    if not _presets_save_all(by_workflow):
+        return False, "写入模板文件失败"
+    _LOG.info("参数模板已随工作流迁移: %s -> %s（%d 个）", src, dst, len(bucket))
+    return True, "模板已迁移到新工作流"
+
+
+def _preset_delete(workflow, name):
+    if not _valid_workflow_key(workflow):
+        return False, "工作流标识非法"
+    if not _valid_preset_name(name):
+        return False, "模板名非法"
+    name = name.strip()
+    by_workflow = _presets_load_all()
+    bucket = by_workflow.get(workflow) or {}
+    if name not in bucket:
+        return False, "模板不存在: %s" % name
+    bucket.pop(name, None)
+    if bucket:
+        by_workflow[workflow] = bucket
+    else:
+        by_workflow.pop(workflow, None)
+    if not _presets_save_all(by_workflow):
+        return False, "写入模板文件失败"
+    _LOG.info("已删除参数模板: [%s] %s", workflow, name)
+    return True, "模板已删除"
+
+
 def state_payload():
     keys = _available()
     return {
@@ -471,6 +615,36 @@ def _register_routes():
         if not ok:
             return web.json_response({"ok": False, "error": msg}, status=400)
         return web.json_response({"ok": True, "message": msg})
+
+    @routes.get("/accel_switch_presets")
+    async def get_presets(request):
+        workflow = request.query.get("workflow")
+        if workflow is not None:
+            return web.json_response({"ok": True, "workflow": workflow,
+                                      "presets": _presets_for(workflow)})
+        return web.json_response({"ok": True, "presets": _presets_load_all()})
+
+    @routes.post("/accel_switch_presets")
+    async def post_preset(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+        workflow = data.get("workflow")
+        action = data.get("action", "save")
+        if action == "delete":
+            ok, msg = _preset_delete(workflow, data.get("name"))
+        elif action == "save":
+            ok, msg = _preset_put(workflow, data.get("name"), data.get("preset"))
+        elif action == "move":
+            ok, msg = _preset_move(data.get("from"), data.get("to"))
+        else:
+            return web.json_response({"ok": False, "error": "未知 action"}, status=400)
+        if not ok:
+            return web.json_response({"ok": False, "error": msg}, status=400)
+        return web.json_response({"ok": True, "message": msg,
+                                  "workflow": workflow,
+                                  "presets": _presets_for(workflow)})
 
     routes._accel_switch_registered = True
 
