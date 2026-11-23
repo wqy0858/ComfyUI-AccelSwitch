@@ -1,7 +1,7 @@
 [project]
 name = "accel-switch"
-version = "1.1.0"
-description = "ComfyUI 顶栏一键切换全局注意力加速后端 + 顶栏缩放 + 工作流保存时设置快照/一键恢复（纯补丁，无节点）| Switch global attention backend, zoom top bar, and restore settings captured at workflow save"
+version = "1.2.0"
+description = "ComfyUI 顶栏加速切换 + 缩放 + 工作流设置快照/自动套用/一键恢复 + 后端跑分（纯补丁，无节点）| Switch attention backend, zoom, restore saved settings and benchmark backends"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 classifiers = [

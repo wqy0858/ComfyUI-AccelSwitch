@@ -13,8 +13,9 @@
      本模块只替换自己注入的覆盖（_accel_switch_owned 标记），不碰节点设置的。
 
 选择持久化到 state.json，重启 ComfyUI 后自动恢复。
-API：GET  /accel_switch              查询状态与可用后端
-     POST /accel_switch {"backend": k} 切换（k=auto 恢复启动默认）
+API：GET  /accel_switch                  查询状态与可用后端
+     POST /accel_switch {"backend": k}   切换（k=auto 恢复启动默认）
+     POST /accel_switch_benchmark        跑分（可用后端耗时排序，不改当前选择）
 """
 
 import functools
@@ -22,6 +23,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 _LOG = logging.getLogger("AccelSwitch")
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -231,8 +233,83 @@ def state_payload():
     return {
         "current": _current,
         "available": {k: BACKENDS[k] for k in keys},
+        "all": {k: {**v, "available": k in keys} for k, v in BACKENDS.items()},
         "startup_default": _label("auto"),
     }
+
+
+# ---------------------------------------------------------------- 后端跑分
+
+def _benchmark(params=None):
+    """用固定合成注意力负载测各可用后端，返回耗时列表（毫秒/次，越小越快）。
+
+    只直接调用注册表里的函数，不修改当前后端 / 不碰已加载模型；
+    跑完自动释放临时张量。出错的后端单独记录 error，不影响其他项。
+    """
+    params = params if isinstance(params, dict) else {}
+    try:
+        warmup = max(0, min(20, int(params.get("warmup", 2))))
+        iters = max(1, min(30, int(params.get("iters", 5))))
+        tokens = max(32, min(2048, int(params.get("tokens", 256))))
+        heads = max(1, min(64, int(params.get("heads", 8))))
+        dim = max(16, min(256, int(params.get("dim", 64))))
+    except (TypeError, ValueError):
+        return {"error": "参数必须是整数"}, 400
+
+    try:
+        import torch
+        import comfy.model_management as mm
+        device = mm.get_torch_device()
+        if getattr(device, "type", None) != "cuda":
+            return {"error": "后端跑分需要 CUDA 设备"}, 400
+    except Exception as e:
+        return {"error": "无法获取 GPU: %s" % e}, 400
+
+    registry = _registry()
+    results = []
+    tensors = None
+    try:
+        shape = (1, tokens, heads * dim)
+        tensors = (torch.randn(shape, device=device, dtype=torch.float16),
+                   torch.randn(shape, device=device, dtype=torch.float16),
+                   torch.randn(shape, device=device, dtype=torch.float16))
+        q, k, v = tensors
+        for key in _available():
+            if key == "auto":
+                continue
+            fn = registry.get(key)
+            label = _label(key)
+            if fn is None:
+                results.append({"key": key, "label": label, "error": "后端函数不可用"})
+                continue
+            try:
+                for _ in range(warmup):
+                    fn(q, k, v, heads)
+                torch.cuda.synchronize(device)
+                started = time.perf_counter()
+                for _ in range(iters):
+                    fn(q, k, v, heads)
+                torch.cuda.synchronize(device)
+                ms = (time.perf_counter() - started) * 1000.0 / iters
+                results.append({"key": key, "label": label, "ms": round(ms, 3)})
+            except Exception as e:
+                results.append({"key": key, "label": label, "error": str(e)[:240]})
+    except Exception as e:
+        return {"error": "跑分初始化失败: %s" % e}, 500
+    finally:
+        del tensors
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    results.sort(key=lambda r: r.get("ms", float("inf")))
+    return {
+        "ok": True,
+        "params": {"warmup": warmup, "iters": iters, "tokens": tokens,
+                   "heads": heads, "dim": dim},
+        "results": results,
+    }, 200
 
 
 # ---------------------------------------------------------------- HTTP 接口
@@ -268,6 +345,15 @@ def _register_routes():
         if not ok:
             return web.json_response({"error": msg}, status=400)
         return web.json_response({"ok": True, "message": msg, **state_payload()})
+
+    @routes.post("/accel_switch_benchmark")
+    async def benchmark_state(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        payload, status = _benchmark(data)
+        return web.json_response(payload, status=status)
 
     routes._accel_switch_registered = True
 
