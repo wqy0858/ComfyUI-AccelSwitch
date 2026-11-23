@@ -313,7 +313,13 @@ def state_payload():
 # ---------------------------------------------------------------- 后端跑分
 
 def _benchmark(params=None):
-    """用固定合成注意力负载测各可用后端，返回耗时列表（毫秒/次，越小越快）。
+    """合成注意力微基准：在固定 q/k/v 形状上测各后端裸 kernel 耗时。
+
+    重要：这不是真实出图速度。它只反映"给定形状下、不带 mask 的裸注意力内核"
+    的开销，负载规模 / dtype / mask / 块缓存 / 模型路由都和真实工作流不同。
+    默认形状贴近常见扩散 Transformer（1024 token / 24 头 / 128 维），
+    比早期 256/8/64 更能体现 INT8 / Sage 在大形状下的优势，但仍仅作参考。
+    真实速度以 AccelLog 的 [加速汇总] 采样耗时 / [节点耗时] 为准。
 
     只直接调用注册表里的函数，不修改当前后端 / 不碰已加载模型；
     跑完自动释放临时张量。出错的后端单独记录 error，不影响其他项。
@@ -322,11 +328,15 @@ def _benchmark(params=None):
     try:
         warmup = max(0, min(20, int(params.get("warmup", 2))))
         iters = max(1, min(30, int(params.get("iters", 5))))
-        tokens = max(32, min(2048, int(params.get("tokens", 256))))
-        heads = max(1, min(64, int(params.get("heads", 8))))
-        dim = max(16, min(256, int(params.get("dim", 64))))
+        tokens = max(32, min(8192, int(params.get("tokens", 1024))))
+        heads = max(1, min(64, int(params.get("heads", 24))))
+        dim = max(16, min(256, int(params.get("dim", 128))))
     except (TypeError, ValueError):
         return {"error": "参数必须是整数"}, 400
+
+    dtype_name = str(params.get("dtype", "fp16")).lower()
+    if dtype_name not in ("fp16", "bf16"):
+        return {"error": "dtype 只支持 fp16 或 bf16"}, 400
 
     try:
         import torch
@@ -334,6 +344,7 @@ def _benchmark(params=None):
         device = mm.get_torch_device()
         if getattr(device, "type", None) != "cuda":
             return {"error": "后端跑分需要 CUDA 设备"}, 400
+        dtype = torch.float16 if dtype_name == "fp16" else torch.bfloat16
     except Exception as e:
         return {"error": "无法获取 GPU: %s" % e}, 400
 
@@ -342,9 +353,9 @@ def _benchmark(params=None):
     tensors = None
     try:
         shape = (1, tokens, heads * dim)
-        tensors = (torch.randn(shape, device=device, dtype=torch.float16),
-                   torch.randn(shape, device=device, dtype=torch.float16),
-                   torch.randn(shape, device=device, dtype=torch.float16))
+        tensors = (torch.randn(shape, device=device, dtype=dtype),
+                   torch.randn(shape, device=device, dtype=dtype),
+                   torch.randn(shape, device=device, dtype=dtype))
         q, k, v = tensors
         for key in _available():
             if key == "auto":
@@ -376,10 +387,12 @@ def _benchmark(params=None):
             pass
 
     results.sort(key=lambda r: r.get("ms", float("inf")))
+    shape_desc = "%d token / %d 头 / %d 维 / %s" % (tokens, heads, dim, dtype_name)
     payload = {
         "ok": True,
         "params": {"warmup": warmup, "iters": iters, "tokens": tokens,
-                   "heads": heads, "dim": dim},
+                   "heads": heads, "dim": dim, "dtype": dtype_name},
+        "shape_desc": shape_desc,
         "results": results,
     }
     # 写进 ComfyUI 日志：用户点跑分后在启动器/控制台就能直接看到，不必开浏览器 F12
@@ -387,11 +400,17 @@ def _benchmark(params=None):
     err_rows = [r for r in results if r.get("error")]
     if ok_rows:
         ranking = " | ".join("%s %.3fms" % (r["label"], r["ms"]) for r in ok_rows)
-        _LOG.info("[后端跑分] 毫秒/次（越小越快）: %s", ranking)
+        _LOG.info("[后端跑分] 合成微基准（%s，预热%d次/计时%d次，毫秒/次，数字越小=此形状下裸内核越快）: %s",
+                  shape_desc, warmup, iters, ranking)
     else:
         _LOG.warning("[后端跑分] 没有可用的加速后端完成测试")
     for r in err_rows:
         _LOG.info("[后端跑分] %s 不可用: %s", r["label"], r["error"])
+    # 明确边界，避免把微基准排名误当成真实出图速度
+    _LOG.info("[后端跑分] 注意：这是固定形状、无 mask 的裸注意力微基准，不是真实出图速度；"
+              "真实速度请看 AccelLog 的 [加速汇总] 采样耗时 / [节点耗时]")
+    _LOG.info("[后端跑分] 注意：工作流节点自带的路由（如 Qwen T8 的 sage/kitchen 混合）会绕过顶栏切换，"
+              "此时切换后端不改变采样速度；可改 POST body 的 tokens/heads/dim/dtype 测其他形状")
     return payload, 200
 
 

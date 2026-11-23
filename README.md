@@ -5,7 +5,7 @@ ComfyUI 顶栏补丁，四件事：
 1. **顶栏一键切换全局注意力加速后端**（启动默认 / Kitchen INT8 / SageAttention / SageAttention3 / FlashAttention / xFormers / PyTorch / SubQuadratic / Split）
 2. **顶栏整体缩放**（100% / 90% / 80% / 70% / 60% 五档可调，解决顶栏太占地方）
 3. **工作流保存时快照 + 打开自动套用 + 一键恢复**（后端 + 缩放 + 所有节点参数）
-4. **后端一键跑分**（固定合成负载，列出各可用后端耗时排序）
+4. **后端微基准**（固定合成形状的裸注意力计时，列出各后端该形状下的 kernel 耗时）
 
 - 不注册任何工作流节点
 - 不需要任何额外依赖（纯标准库 + ComfyUI 内部接口 + 原生前端组件）
@@ -58,14 +58,36 @@ ComfyUI 顶栏补丁，四件事：
 
 > 这个功能是「设置快照」，不是工作流版本管理；节点增删 / 连线变化请仍以 ComfyUI 自己的工作流文件为准——快照只负责把还存在的节点参数拧回保存时的值。快照服务端最多保留最近 30 个工作流。
 
-## 功能四：后端跑分
+## 功能四：后端微基准（注意：不是真实出图速度）
 
-下拉菜单里的 **「⚡ 后端跑分」** 会对当前可用的后端逐个跑同一份合成注意力负载（默认 2 次预热 + 5 次计时，256 token / 8 头 / 64 维 fp16），然后：
+下拉菜单里有两个入口：
 
-- 按耗时从快到慢排序，**同时写到两个地方**：① 屏幕右下角弹出可见结果面板（点一下就能看到，不用开 F12）；② ComfyUI 服务端日志，搜索 **`后端跑分`** 即可（`user/comfyui.log` / 启动器控制台）
+- **「⚡ 后端微基准（合成）」**：默认 2 次预热 + 5 次计时，**1024 token / 24 头 / 128 维 fp16**
+- **「⚡ 微基准：Qwen 大形状」**：4096 token / 24 头 / 128 维 bf16，更贴近 Qwen Image 2.1 的注意力形状（显存占用更高）
+
+后端逐个跑同一份合成 q/k/v 的裸注意力函数，然后：
+
+- 按耗时排序，**同时写到两处**：① 屏幕右下角结果面板；② 服务端日志，搜 **`后端跑分`**（`user/comfyui.log` / 启动器控制台）
 - 只直接调用注册表里的注意力函数，**不修改当前后端、不碰已加载模型**，跑完自动清缓存
-- 需要 CUDA；不可用的后端会单独标 error，不影响其他项
-- 请求体可覆盖参数：`{"warmup":2,"iters":5,"tokens":256,"heads":8,"dim":64}`
+- 需要 CUDA；不可用的后端单独标 error，不影响其他项
+- 请求体可覆盖参数（含 dtype）：`{"warmup":2,"iters":5,"tokens":4096,"heads":24,"dim":128,"dtype":"bf16"}`
+
+### 这个数字能说明什么、不能说明什么
+
+**能**：同样形状下，哪个后端的内核本身更快（数字越小 = 该形状下裸内核越快）。
+
+**不能**：它**不等于你工作流的真实出图速度**。负载是固定形状、无 mask 的随机张量，没有真实模型的注意力掩码、块缓存、量化权重布局、序列长度分布。
+
+**形状一变，排名就会反转**。实测同一台机器：
+
+| 形状 | xFormers | Kitchen INT8 |
+|---|---|---|
+| 256 token / 8 头 / 64 维（旧默认值） | **0.119ms**（最快） | 0.214ms |
+| 1024 token / 24 头 / 128 维（新默认值） | 0.503ms | **0.223ms**（最快） |
+
+**判断哪个后端对你更快，请以 AccelLog 的真实运行数据为准**：`[加速汇总]` 的采样耗时、`[节点耗时]`（日志搜这两个关键词）。
+
+另外，如果你的工作流用 **Qwen T8 / XB sage / ModelAttentionBackend** 这类节点，它们自己就设置了注意力路由（例如 T8 的 `sage/kitchen 混合`），**顶栏切换会被这些节点覆盖、进不了采样主路径**——这时切换后端不改变出图速度，微基准排名更与你无关。从 `[加速日志]` 的「来源」一栏能看出这一刀到底是谁决定的。
 
 ## 安装
 
@@ -88,7 +110,7 @@ git clone https://github.com/wqy0858/ComfyUI-AccelSwitch.git ComfyUI-AccelSwitch
 ```text
 GET  /accel_switch                      → {"current": "...", "available": {...}, "all": {...含 available 标记}, "startup_default": "..."}
 POST /accel_switch  {"backend": "sage"} → 切换并返回新状态（auto = 恢复启动默认）
-POST /accel_switch_benchmark  {}         → {"ok": true, "params": {...}, "results": [{"label": "...", "ms": 0.123}, ...]}
+POST /accel_switch_benchmark  {"tokens":4096,"dtype":"bf16"} → {"ok": true, "shape_desc": "...", "params": {...}, "results": [{"label": "...", "ms": 0.123}, ...]}
 GET  /accel_switch_snapshots            → {"ok": true, "snapshots": {"workflows/xx.json": {...}, ...}}
 POST /accel_switch_snapshots  {"file": "workflows/xx.json", "snapshot": {...}} → 写入快照（最多保留 30 个）
 ```

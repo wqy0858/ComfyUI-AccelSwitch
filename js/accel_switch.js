@@ -98,11 +98,11 @@ async function apiSet(key) {
   return j;
 }
 
-async function apiBenchmark() {
+async function apiBenchmark(params) {
   const r = await fetch(API + "_benchmark", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: "{}",
+    body: JSON.stringify(params || {}),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
@@ -416,23 +416,33 @@ function showResultPanel(title, lines, ok = true) {
 }
 
 /** 跑分：后端写日志 + 前端弹面板，点一下就能看到，不用开 F12。 */
-async function runBenchmark() {
+async function runBenchmark(params) {
   flashNotice("测速中…", true);
   try {
-    const j = await apiBenchmark();
+    const j = await apiBenchmark(params);
     const rows = j.results || [];
     const okRows = rows.filter((r) => typeof r.ms === "number");
     const errRows = rows.filter((r) => r.error);
-    const lines = okRows.length
+    const shape = j.shape_desc || (function () {
+      const p = j.params || {};
+      return p.tokens ? `${p.tokens} token / ${p.heads} 头 / ${p.dim} 维 / ${p.dtype || "fp16"}` : "合成负载";
+    })();
+    const lines = ["形状: " + shape + "（预热/计时后取平均，毫秒/次）"];
+    lines.push("注意：这是固定形状、无 mask 的裸注意力微基准，不是真实出图速度");
+    lines.push("真实速度看日志 [加速汇总] 的采样耗时；T8 等节点自带路由会绕过顶栏切换");
+    lines.push("---");
+    const ranked = okRows.length
       ? okRows.map((r, i) => (i + 1) + ". " + r.label + "  " + r.ms + " ms")
       : ["没有可用的后端完成测试"];
+    lines.push(...ranked);
     for (const r of errRows) lines.push("✗ " + r.label + ": " + r.error);
+    lines.push("---");
     lines.push("参数: " + JSON.stringify(j.params || {}));
     lines.push("完整结果已写入 ComfyUI 日志（搜索「后端跑分」）");
     console.table(rows);
-    log("后端跑分完成:", lines.join(" | "));
+    log("后端微基准完成:", lines.join(" | "));
     flashNotice("✓ 跑分完成", true);
-    showResultPanel("后端跑分（毫秒/次，越小越快）", lines, okRows.length > 0);
+    showResultPanel("后端微基准（合成负载，越小=此形状内核越快）", lines, okRows.length > 0);
   } catch (e) {
     warn("跑分失败:", e.message || e);
     flashError();
@@ -524,10 +534,17 @@ async function render() {
     }).element;
   });
   items.push(new ComfyButton({
-    content: "     ⚡ 后端跑分",
-    tooltip: "合成注意力负载测各后端，结果弹窗显示并写入 ComfyUI 日志；不改当前选择",
+    content: "     ⚡ 后端微基准（合成）",
+    tooltip: "固定形状裸注意力微基准（默认 1024 token/24 头/128 维），结果弹窗+日志；"
+           + "不是真实出图速度，真实速度看 [加速汇总]",
     classList: "accel-switch-item accel-switch-bench-item",
     action: () => runBenchmark(),
+  }).element);
+  items.push(new ComfyButton({
+    content: "     ⚡ 微基准：Qwen 大形状",
+    tooltip: "贴近 Qwen Image 2.1：4096 token / 24 头 / 128 维 bf16；显存占用更高",
+    classList: "accel-switch-item accel-switch-bench-item",
+    action: () => runBenchmark({ tokens: 4096, heads: 24, dim: 128, dtype: "bf16", iters: 3 }),
   }).element);
   items.push(new ComfyButton({
     content: (lastSnapshot ? "↺  " : "    ") + "恢复上次保存的设置",
