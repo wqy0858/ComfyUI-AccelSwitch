@@ -1,7 +1,7 @@
 [project]
 name = "accel-switch"
-version = "1.0.1"
-description = "ComfyUI 顶栏一键切换全局注意力加速后端（Sage/Kitchen/xFormers/PyTorch/SubQuad/Split）+ 顶栏缩放，即时生效、免重启、不改工作流（纯补丁，无节点）| Switch the global attention backend from the top bar instantly, no restart, no workflow changes"
+version = "1.1.0"
+description = "ComfyUI 顶栏一键切换全局注意力加速后端 + 顶栏缩放 + 工作流保存时设置快照/一键恢复（纯补丁，无节点）| Switch global attention backend, zoom top bar, and restore settings captured at workflow save"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 classifiers = [
